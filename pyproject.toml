@@ -16,4 +16,5 @@ dependencies = [
     "pyrekordbox>=0.4.4",
     "seaborn>=0.13.2",
     "sklearn",
+    "xgboost",
 ]
