@@ -5,6 +5,15 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "librosa>=0.11.0",
+    "matplotlib",
+    "musicnn",
+    "nbformat>=5.10.4",
+    "pandas",
+    "plotly>=6.3.1",
     "polars>=1.34.0",
+    "pyarrow>=21.0.0",
     "pyrekordbox>=0.4.4",
+    "seaborn>=0.13.2",
+    "sklearn",
 ]
