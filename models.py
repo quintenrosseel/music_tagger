@@ -10,7 +10,20 @@ Models implemented:
 - Decision Tree (highly explainable)
 - Random Forest (ensemble)
 - XGBoost (gradient boosting)
+
+Hyperparameter tuning:
+- Grid search and randomized search for all models
+- Optuna-based optimization for advanced tuning
+- Threshold optimization for multi-label predictions
+
+Model persistence:
+- Save/load models with metadata and configuration
 """
+
+import json
+import pickle
+from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import polars as pl
@@ -875,3 +888,945 @@ def train_and_compare_models(
     print(f"{'=' * 70}\n")
 
     return comparison_df
+
+
+def tune_random_forest_hyperparams(
+    X_train: pl.DataFrame | np.ndarray,
+    y_train: pl.DataFrame | np.ndarray,
+    X_val: pl.DataFrame | np.ndarray | None,
+    y_val: pl.DataFrame | np.ndarray | None,
+    tags: list[str],
+    search_type: str = "grid",
+    n_iter: int = 20,
+    verbose: bool = True,
+) -> dict:
+    """Tune Random Forest hyperparameters using grid or random search.
+
+    This function systematically searches for the best hyperparameters for
+    a Random Forest classifier on your multi-label data.
+
+    Parameters
+    ----------
+    X_train : pl.DataFrame or np.ndarray
+        Training features
+    y_train : pl.DataFrame or np.ndarray
+        Training labels (binary matrix)
+    X_val : pl.DataFrame or np.ndarray
+        Validation features for evaluation
+    y_val : pl.DataFrame or np.ndarray
+        Validation labels (binary matrix)
+    tags : list[str]
+        List of tag names
+    search_type : {'grid', 'random'}, default='grid'
+        Type of search:
+        - 'grid': Exhaustive search over all parameter combinations (slower but thorough)
+        - 'random': Random sampling of parameter combinations (faster, good for initial exploration)
+    n_iter : int, default=20
+        Number of iterations for random search (ignored for grid search)
+    verbose : bool, default=True
+        Whether to print progress
+
+    Returns
+    -------
+    results : dict
+        Dictionary containing:
+        - 'best_params': Best hyperparameters found
+        - 'best_model': Trained model with best parameters
+        - 'best_score': Best macro F1 score achieved
+        - 'all_results': DataFrame with all tested configurations and scores
+
+    Examples
+    --------
+    >>> # Grid search (thorough but slower)
+    >>> results = tune_random_forest_hyperparams(
+    ...     X_train, y_train, X_val, y_val, tags,
+    ...     search_type='grid'
+    ... )
+    >>>
+    >>> # Random search (faster, good for initial exploration)
+    >>> results = tune_random_forest_hyperparams(
+    ...     X_train, y_train, X_val, y_val, tags,
+    ...     search_type='random',
+    ...     n_iter=30
+    ... )
+    >>>
+    >>> print(f"Best parameters: {results['best_params']}")
+    >>> print(f"Best score: {results['best_score']:.4f}")
+    >>> best_model = results['best_model']
+    """
+    # Validate that validation sets are provided
+    if X_val is None or y_val is None:
+        raise ValueError("Validation sets (X_val, y_val) are required for hyperparameter tuning")
+
+    # Convert to numpy if needed
+    if isinstance(X_train, pl.DataFrame):
+        X_train = X_train.to_numpy()
+    if isinstance(y_train, pl.DataFrame):
+        y_train = y_train.to_numpy()
+    if isinstance(X_val, pl.DataFrame):
+        X_val = X_val.to_numpy()
+    if isinstance(y_val, pl.DataFrame):
+        y_val = y_val.to_numpy()
+
+    if verbose:
+        print(f"\n{'=' * 70}")
+        print("RANDOM FOREST HYPERPARAMETER TUNING")
+        print(f"Search type: {search_type}")
+        print(f"{'=' * 70}\n")
+
+    # Define parameter grid
+    param_grid = {
+        "n_estimators": [100, 200, 300, 500],
+        "max_depth": [10, 15, 20, 30, None],
+        "min_samples_split": [2, 5, 10, 20],
+        "min_samples_leaf": [1, 2, 5, 10],
+        "max_features": ["sqrt", "log2", None],
+        "class_weight": ["balanced", "balanced_subsample"],
+    }
+
+    if search_type == "random":
+        # For random search, expand the search space
+        param_grid["max_samples"] = [0.7, 0.8, 0.9, 1.0]
+
+    # Store results
+    all_results = []
+    best_score = -1
+    best_params = None
+    best_model = None
+
+    if search_type == "grid":
+        # Generate all combinations
+        from itertools import product
+
+        keys = list(param_grid.keys())
+        values = [param_grid[k] for k in keys]
+
+        total_combinations = 1
+        for v in values:
+            total_combinations *= len(v)
+
+        if verbose:
+            print(f"Testing {total_combinations} parameter combinations...")
+            print("This may take a while...\n")
+
+        for i, combination in enumerate(product(*values)):
+            params = dict(zip(keys, combination))
+
+            # Create base RandomForestClassifier with all parameters
+            base_model = RandomForestClassifier(
+                n_estimators=params["n_estimators"],
+                max_depth=params["max_depth"],
+                min_samples_split=params["min_samples_split"],
+                min_samples_leaf=params["min_samples_leaf"],
+                max_features=params["max_features"],
+                class_weight=params["class_weight"],
+                random_state=42,
+                n_jobs=-1,
+            )
+            model = MultiOutputClassifier(base_model, n_jobs=-1)
+
+            model.fit(X_train, y_train)
+
+            # Evaluate on validation set
+            metrics = evaluate_model(
+                model, X_val, y_val, tags, verbose=False
+            )
+
+            score = metrics["macro_f1"]
+            all_results.append({**params, "macro_f1": score})
+
+            if score > best_score:
+                best_score = score
+                best_params = params
+                best_model = model
+
+            if verbose and (i + 1) % 10 == 0:
+                print(f"Progress: {i + 1}/{total_combinations} combinations tested")
+
+    else:  # random search
+        import random
+
+        if verbose:
+            print(f"Testing {n_iter} random parameter combinations...\n")
+
+        for i in range(n_iter):
+            # Randomly sample parameters
+            params = {k: random.choice(v) for k, v in param_grid.items()}
+
+            # Create base RandomForestClassifier with all parameters
+            base_model = RandomForestClassifier(
+                n_estimators=params["n_estimators"],
+                max_depth=params["max_depth"],
+                min_samples_split=params["min_samples_split"],
+                min_samples_leaf=params["min_samples_leaf"],
+                max_features=params["max_features"],
+                class_weight=params["class_weight"],
+                max_samples=params.get("max_samples", None),
+                random_state=42,
+                n_jobs=-1,
+            )
+            model = MultiOutputClassifier(base_model, n_jobs=-1)
+
+            model.fit(X_train, y_train)
+
+            # Evaluate on validation set
+            metrics = evaluate_model(
+                model, X_val, y_val, tags, verbose=False
+            )
+
+            score = metrics["macro_f1"]
+            all_results.append({**params, "macro_f1": score})
+
+            if score > best_score:
+                best_score = score
+                best_params = params
+                best_model = model
+
+            if verbose and (i + 1) % 5 == 0:
+                print(f"Progress: {i + 1}/{n_iter} combinations tested")
+
+    if verbose:
+        print(f"\n{'=' * 70}")
+        print("TUNING RESULTS")
+        print(f"{'=' * 70}")
+        print(f"\nBest macro F1 score: {best_score:.4f}")
+        print("\nBest parameters:")
+        for k, v in best_params.items():
+            print(f"  {k}: {v}")
+        print(f"\n{'=' * 70}\n")
+
+    results_df = pl.DataFrame(all_results).sort("macro_f1", descending=True)
+
+    return {
+        "best_params": best_params,
+        "best_model": best_model,
+        "best_score": best_score,
+        "all_results": results_df,
+    }
+
+
+def tune_xgboost_hyperparams(
+    X_train: pl.DataFrame | np.ndarray,
+    y_train: pl.DataFrame | np.ndarray,
+    X_val: pl.DataFrame | np.ndarray | None,
+    y_val: pl.DataFrame | np.ndarray | None,
+    tags: list[str],
+    search_type: str = "grid",
+    n_iter: int = 20,
+    verbose: bool = True,
+) -> dict:
+    """Tune XGBoost hyperparameters using grid or random search.
+
+    This function systematically searches for the best hyperparameters for
+    an XGBoost classifier on your multi-label data.
+
+    Parameters
+    ----------
+    X_train : pl.DataFrame or np.ndarray
+        Training features
+    y_train : pl.DataFrame or np.ndarray
+        Training labels (binary matrix)
+    X_val : pl.DataFrame or np.ndarray
+        Validation features for evaluation
+    y_val : pl.DataFrame or np.ndarray
+        Validation labels (binary matrix)
+    tags : list[str]
+        List of tag names
+    search_type : {'grid', 'random'}, default='grid'
+        Type of search:
+        - 'grid': Exhaustive search over all parameter combinations
+        - 'random': Random sampling of parameter combinations
+    n_iter : int, default=20
+        Number of iterations for random search (ignored for grid search)
+    verbose : bool, default=True
+        Whether to print progress
+
+    Returns
+    -------
+    results : dict
+        Dictionary containing:
+        - 'best_params': Best hyperparameters found
+        - 'best_model': Trained model with best parameters
+        - 'best_score': Best macro F1 score achieved
+        - 'all_results': DataFrame with all tested configurations and scores
+
+    Examples
+    --------
+    >>> # Grid search
+    >>> results = tune_xgboost_hyperparams(
+    ...     X_train, y_train, X_val, y_val, tags,
+    ...     search_type='grid'
+    ... )
+    >>>
+    >>> # Random search
+    >>> results = tune_xgboost_hyperparams(
+    ...     X_train, y_train, X_val, y_val, tags,
+    ...     search_type='random',
+    ...     n_iter=30
+    ... )
+    >>>
+    >>> print(f"Best parameters: {results['best_params']}")
+    >>> best_model = results['best_model']
+    """
+    if not HAS_XGBOOST:
+        raise ImportError("XGBoost is not installed. Install with: uv add xgboost")
+
+    # Validate that validation sets are provided
+    if X_val is None or y_val is None:
+        raise ValueError("Validation sets (X_val, y_val) are required for hyperparameter tuning")
+
+    # Convert to numpy if needed
+    if isinstance(X_train, pl.DataFrame):
+        X_train = X_train.to_numpy()
+    if isinstance(y_train, pl.DataFrame):
+        y_train = y_train.to_numpy()
+    if isinstance(X_val, pl.DataFrame):
+        X_val = X_val.to_numpy()
+    if isinstance(y_val, pl.DataFrame):
+        y_val = y_val.to_numpy()
+
+    if verbose:
+        print(f"\n{'=' * 70}")
+        print("XGBOOST HYPERPARAMETER TUNING")
+        print(f"Search type: {search_type}")
+        print(f"{'=' * 70}\n")
+
+    # Define parameter grid
+    param_grid = {
+        "n_estimators": [100, 200, 300, 500],
+        "max_depth": [3, 6, 10, 15],
+        "learning_rate": [0.01, 0.05, 0.1, 0.2],
+        "subsample": [0.6, 0.8, 1.0],
+        "colsample_bytree": [0.6, 0.8, 1.0],
+        "scale_pos_weight": [1, 3, 5, 10],
+        "min_child_weight": [1, 3, 5],
+        "gamma": [0, 0.1, 0.3],
+    }
+
+    # Store results
+    all_results = []
+    best_score = -1
+    best_params = None
+    best_model = None
+
+    if search_type == "grid":
+        # Generate all combinations
+        from itertools import product
+
+        keys = list(param_grid.keys())
+        values = [param_grid[k] for k in keys]
+
+        total_combinations = 1
+        for v in values:
+            total_combinations *= len(v)
+
+        if verbose:
+            print(f"Testing {total_combinations} parameter combinations...")
+            print("This may take a while...\n")
+
+        for i, combination in enumerate(product(*values)):
+            params = dict(zip(keys, combination))
+
+            # Create base XGBClassifier with all parameters
+            base_model = XGBClassifier(
+                n_estimators=params["n_estimators"],
+                max_depth=params["max_depth"],
+                learning_rate=params["learning_rate"],
+                subsample=params["subsample"],
+                colsample_bytree=params["colsample_bytree"],
+                scale_pos_weight=params["scale_pos_weight"],
+                min_child_weight=params["min_child_weight"],
+                gamma=params["gamma"],
+                random_state=42,
+                n_jobs=-1,
+                eval_metric="logloss",
+            )
+            model = MultiOutputClassifier(base_model, n_jobs=-1)
+
+            model.fit(X_train, y_train)
+
+            # Evaluate on validation set
+            metrics = evaluate_model(
+                model, X_val, y_val, tags, verbose=False
+            )
+
+            score = metrics["macro_f1"]
+            all_results.append({**params, "macro_f1": score})
+
+            if score > best_score:
+                best_score = score
+                best_params = params
+                best_model = model
+
+            if verbose and (i + 1) % 10 == 0:
+                print(f"Progress: {i + 1}/{total_combinations} combinations tested")
+
+    else:  # random search
+        import random
+
+        if verbose:
+            print(f"Testing {n_iter} random parameter combinations...\n")
+
+        for i in range(n_iter):
+            # Randomly sample parameters
+            params = {k: random.choice(v) for k, v in param_grid.items()}
+
+            # Create base XGBClassifier with all parameters
+            base_model = XGBClassifier(
+                n_estimators=params["n_estimators"],
+                max_depth=params["max_depth"],
+                learning_rate=params["learning_rate"],
+                subsample=params["subsample"],
+                colsample_bytree=params["colsample_bytree"],
+                scale_pos_weight=params["scale_pos_weight"],
+                min_child_weight=params["min_child_weight"],
+                gamma=params["gamma"],
+                random_state=42,
+                n_jobs=-1,
+                eval_metric="logloss",
+            )
+            model = MultiOutputClassifier(base_model, n_jobs=-1)
+
+            model.fit(X_train, y_train)
+
+            # Evaluate on validation set
+            metrics = evaluate_model(
+                model, X_val, y_val, tags, verbose=False
+            )
+
+            score = metrics["macro_f1"]
+            all_results.append({**params, "macro_f1": score})
+
+            if score > best_score:
+                best_score = score
+                best_params = params
+                best_model = model
+
+            if verbose and (i + 1) % 5 == 0:
+                print(f"Progress: {i + 1}/{n_iter} combinations tested")
+
+    if verbose:
+        print(f"\n{'=' * 70}")
+        print("TUNING RESULTS")
+        print(f"{'=' * 70}")
+        print(f"\nBest macro F1 score: {best_score:.4f}")
+        print("\nBest parameters:")
+        for k, v in best_params.items():
+            print(f"  {k}: {v}")
+        print(f"\n{'=' * 70}\n")
+
+    results_df = pl.DataFrame(all_results).sort("macro_f1", descending=True)
+
+    return {
+        "best_params": best_params,
+        "best_model": best_model,
+        "best_score": best_score,
+        "all_results": results_df,
+    }
+
+
+def optimize_prediction_thresholds(
+    model,
+    X_val: pl.DataFrame | np.ndarray | None,
+    y_val: pl.DataFrame | np.ndarray | None,
+    tags: list[str],
+    metric: str = "f1",
+    verbose: bool = True,
+) -> dict:
+    """Optimize prediction thresholds for each label independently on validation set.
+
+    Instead of using the default 0.5 threshold, this function finds the optimal
+    threshold for each label that maximizes the specified metric. This is especially
+    important for imbalanced multi-label classification.
+
+    Parameters
+    ----------
+    model : MultiOutputClassifier
+        Trained multi-label classifier
+    X_val : pl.DataFrame or np.ndarray
+        Validation features
+    y_val : pl.DataFrame or np.ndarray
+        Validation labels (binary matrix)
+    tags : list[str]
+        List of tag names
+    metric : {'f1', 'precision', 'recall'}, default='f1'
+        Which metric to optimize for each label
+    verbose : bool, default=True
+        Whether to print progress
+
+    Returns
+    -------
+    results : dict
+        Dictionary containing:
+        - 'thresholds': Array of optimal thresholds (one per label)
+        - 'threshold_df': DataFrame with per-label threshold info
+        - 'default_metrics': Metrics using default 0.5 threshold
+        - 'optimized_metrics': Metrics using optimized thresholds
+        - 'improvement': Improvement in macro F1 score
+
+    Examples
+    --------
+    >>> # Train model
+    >>> model = get_random_forest_model()
+    >>> model.fit(X_train, y_train)
+    >>>
+    >>> # Optimize thresholds on validation set
+    >>> threshold_results = optimize_prediction_thresholds(
+    ...     model, X_val, y_val, tags, metric='f1'
+    ... )
+    >>>
+    >>> # Use optimized thresholds for test set predictions
+    >>> _, test_probs = predict_with_threshold(model, X_test, threshold=0.5)
+    >>> y_pred = (test_probs >= threshold_results['thresholds']).astype(int)
+    """
+    # Validate that validation sets are provided
+    if X_val is None or y_val is None:
+        raise ValueError("Validation sets (X_val, y_val) are required for threshold optimization")
+
+    # Convert to numpy if needed
+    if isinstance(X_val, pl.DataFrame):
+        X_val = X_val.to_numpy()
+    if isinstance(y_val, pl.DataFrame):
+        y_val = y_val.to_numpy()
+
+    if verbose:
+        print(f"\n{'=' * 70}")
+        print("THRESHOLD OPTIMIZATION")
+        print(f"Optimizing for: {metric}")
+        print(f"{'=' * 70}\n")
+
+    # Get baseline metrics with default threshold
+    default_metrics = evaluate_model(
+        model, X_val, y_val, tags, verbose=False
+    )
+
+    # Find optimal thresholds
+    optimal_thresholds = find_optimal_thresholds(
+        model, X_val, y_val, metric=metric
+    )
+
+    # Get metrics with optimized thresholds
+    _, probabilities = predict_with_threshold(model, X_val, threshold=0.5)
+    y_pred_optimized = (probabilities >= optimal_thresholds).astype(int)
+
+    # Calculate per-label metrics
+    precision, recall, f1, support = precision_recall_fscore_support(
+        y_val, y_pred_optimized, average=None, zero_division=0
+    )
+
+    # Calculate macro averages
+    opt_macro_precision, opt_macro_recall, opt_macro_f1, _ = (
+        precision_recall_fscore_support(
+            y_val, y_pred_optimized, average="macro", zero_division=0
+        )
+    )
+
+    # Create threshold comparison DataFrame
+    threshold_df = pl.DataFrame(
+        {
+            "tag": tags,
+            "threshold": optimal_thresholds,
+            "default_f1": default_metrics["per_label_metrics"]["f1_score"],
+            "optimized_f1": f1,
+            "improvement": f1 - default_metrics["per_label_metrics"]["f1_score"].to_numpy(),
+        }
+    ).sort("improvement", descending=True)
+
+    improvement = opt_macro_f1 - default_metrics["macro_f1"]
+
+    if verbose:
+        print(f"Default macro F1: {default_metrics['macro_f1']:.4f}")
+        print(f"Optimized macro F1: {opt_macro_f1:.4f}")
+        print(f"Improvement: {improvement:+.4f}\n")
+        print("Per-label thresholds (sorted by F1 improvement):")
+        print(threshold_df)
+        print(f"\n{'=' * 70}\n")
+
+    return {
+        "thresholds": optimal_thresholds,
+        "threshold_df": threshold_df,
+        "default_metrics": default_metrics,
+        "optimized_metrics": {
+            "macro_precision": opt_macro_precision,
+            "macro_recall": opt_macro_recall,
+            "macro_f1": opt_macro_f1,
+            "per_label_f1": f1,
+        },
+        "improvement": improvement,
+    }
+
+
+def save_model(
+    model,
+    model_name: str,
+    save_dir: str = "models",
+    tags: list[str] | None = None,
+    thresholds: np.ndarray | None = None,
+    hyperparams: dict | None = None,
+    scaler=None,
+    pca=None,
+    metrics: dict | None = None,
+    tag_group: str | None = None,
+    verbose: bool = True,
+) -> dict[str, str]:
+    """Save a trained model with metadata and configuration.
+
+    This function saves:
+    - The trained model
+    - Optimal thresholds (if provided)
+    - Preprocessing components (scaler, PCA)
+    - Hyperparameters used
+    - Training metadata and metrics
+
+    Parameters
+    ----------
+    model : MultiOutputClassifier
+        Trained multi-label classifier to save
+    model_name : str
+        Name for the model (e.g., "random_forest", "xgboost")
+    save_dir : str, default="models"
+        Directory to save model files
+    tags : list[str], optional
+        List of tag names (labels)
+    thresholds : np.ndarray, optional
+        Optimized thresholds for each label
+    hyperparams : dict, optional
+        Hyperparameters used to train the model
+    scaler : PolarsStandardScaler, optional
+        Fitted scaler for preprocessing
+    pca : PolarsPCA, optional
+        Fitted PCA for dimensionality reduction
+    metrics : dict, optional
+        Performance metrics (e.g., from evaluate_model)
+    tag_group : str, optional
+        Tag group name (e.g., "Genre", "Mood")
+    verbose : bool, default=True
+        Whether to print save information
+
+    Returns
+    -------
+    paths : dict[str, str]
+        Dictionary with paths to saved files:
+        - 'model': Path to model pickle file
+        - 'config': Path to configuration JSON file
+
+    Examples
+    --------
+    >>> # Basic usage
+    >>> model = get_random_forest_model(n_estimators=200)
+    >>> model.fit(X_train, y_train)
+    >>> paths = save_model(
+    ...     model=model,
+    ...     model_name="random_forest_genre",
+    ...     tags=tags,
+    ...     tag_group="Genre"
+    ... )
+
+    >>> # With full metadata
+    >>> paths = save_model(
+    ...     model=rf_results['best_model'],
+    ...     model_name="random_forest_genre_tuned",
+    ...     tags=result.tags,
+    ...     thresholds=threshold_results['thresholds'],
+    ...     hyperparams=rf_results['best_params'],
+    ...     scaler=result.scaler,
+    ...     pca=result.pca,
+    ...     metrics={'macro_f1': 0.45, 'hamming_loss': 0.12},
+    ...     tag_group="Genre"
+    ... )
+    """
+    # Create save directory if it doesn't exist
+    save_path = Path(save_dir)
+    save_path.mkdir(parents=True, exist_ok=True)
+
+    # Generate timestamp for unique filenames
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_filename = f"{model_name}_{timestamp}"
+
+    # Save model
+    model_file = save_path / f"{base_filename}_model.pkl"
+    with open(model_file, 'wb') as f:
+        pickle.dump(model, f)
+
+    # Create configuration dictionary
+    config = {
+        "model_name": model_name,
+        "timestamp": timestamp,
+        "datetime": datetime.now().isoformat(),
+        "tag_group": tag_group,
+        "tags": tags,
+        "n_labels": len(tags) if tags else None,
+        "hyperparameters": hyperparams,
+        "has_thresholds": thresholds is not None,
+        "has_scaler": scaler is not None,
+        "has_pca": pca is not None,
+        "metrics": metrics,
+    }
+
+    # Save thresholds if provided
+    if thresholds is not None:
+        thresholds_file = save_path / f"{base_filename}_thresholds.npy"
+        np.save(thresholds_file, thresholds)
+        config["thresholds_file"] = str(thresholds_file)
+
+        if tags:
+            config["thresholds_dict"] = {
+                tag: float(thresh) for tag, thresh in zip(tags, thresholds)
+            }
+
+    # Save scaler if provided
+    if scaler is not None:
+        scaler_file = save_path / f"{base_filename}_scaler.pkl"
+        with open(scaler_file, 'wb') as f:
+            pickle.dump(scaler, f)
+        config["scaler_file"] = str(scaler_file)
+
+    # Save PCA if provided
+    if pca is not None:
+        pca_file = save_path / f"{base_filename}_pca.pkl"
+        with open(pca_file, 'wb') as f:
+            pickle.dump(pca, f)
+        config["pca_file"] = str(pca_file)
+        config["n_components"] = pca.n_components_
+        config["variance_explained"] = float(pca.explained_variance_ratio_.sum())
+
+    # Save configuration
+    config_file = save_path / f"{base_filename}_config.json"
+    with open(config_file, 'w') as f:
+        json.dump(config, f, indent=2)
+
+    if verbose:
+        print(f"\n{'=' * 70}")
+        print("MODEL SAVED SUCCESSFULLY")
+        print(f"{'=' * 70}")
+        print(f"Model name: {model_name}")
+        print(f"Tag group: {tag_group}")
+        print(f"Number of labels: {len(tags) if tags else 'N/A'}")
+        print(f"\nFiles saved:")
+        print(f"  Model:         {model_file}")
+        print(f"  Configuration: {config_file}")
+        if thresholds is not None:
+            print(f"  Thresholds:    {thresholds_file}")
+        if scaler is not None:
+            print(f"  Scaler:        {scaler_file}")
+        if pca is not None:
+            print(f"  PCA:           {pca_file}")
+        if metrics:
+            print("\nMetrics:")
+            for key, value in metrics.items():
+                print(f"  {key}: {value:.4f}" if isinstance(value, (int, float)) else f"  {key}: {value}")
+        print(f"{'=' * 70}\n")
+
+    return {
+        "model": str(model_file),
+        "config": str(config_file),
+        "thresholds": str(thresholds_file) if thresholds is not None else None,
+        "scaler": str(scaler_file) if scaler is not None else None,
+        "pca": str(pca_file) if pca is not None else None,
+    }
+
+
+def load_model(model_file: str, verbose: bool = True) -> dict:
+    """Load a saved model with all its metadata and configuration.
+
+    Parameters
+    ----------
+    model_file : str
+        Path to the model pickle file (e.g., "models/random_forest_20241015_123456_model.pkl")
+        Can also be the base filename or config file path
+    verbose : bool, default=True
+        Whether to print load information
+
+    Returns
+    -------
+    model_data : dict
+        Dictionary containing:
+        - 'model': The loaded model
+        - 'config': Configuration dictionary
+        - 'thresholds': Thresholds array (if available)
+        - 'scaler': Fitted scaler (if available)
+        - 'pca': Fitted PCA (if available)
+        - 'tags': List of tag names
+
+    Examples
+    --------
+    >>> # Load model
+    >>> model_data = load_model("models/random_forest_genre_tuned_20241015_123456_model.pkl")
+    >>> model = model_data['model']
+    >>> thresholds = model_data['thresholds']
+    >>> tags = model_data['tags']
+    >>>
+    >>> # Make predictions
+    >>> _, probs = predict_with_threshold(model, X_test, threshold=0.5)
+    >>> y_pred = (probs >= thresholds).astype(int)
+    """
+    model_path = Path(model_file)
+
+    # Handle different input formats
+    if model_path.suffix == '.json':
+        # User provided config file
+        config_file = model_path
+        base_path = model_path.parent / model_path.stem.replace('_config', '')
+        model_file = str(base_path) + '_model.pkl'
+    elif model_path.suffix == '.pkl':
+        # User provided model file
+        base_path = model_path.parent / model_path.stem.replace('_model', '')
+        config_file = Path(str(base_path) + '_config.json')
+    else:
+        # User provided base filename
+        base_path = model_path
+        model_file = str(base_path) + '_model.pkl'
+        config_file = Path(str(base_path) + '_config.json')
+
+    # Load configuration
+    if not config_file.exists():
+        raise FileNotFoundError(f"Configuration file not found: {config_file}")
+
+    with open(config_file, 'r') as f:
+        config = json.load(f)
+
+    # Load model
+    if not Path(model_file).exists():
+        raise FileNotFoundError(f"Model file not found: {model_file}")
+
+    with open(model_file, 'rb') as f:
+        model = pickle.load(f)
+
+    # Load thresholds if available
+    thresholds = None
+    if config.get("has_thresholds") and "thresholds_file" in config:
+        thresholds_file = config["thresholds_file"]
+        if Path(thresholds_file).exists():
+            thresholds = np.load(thresholds_file)
+
+    # Load scaler if available
+    scaler = None
+    if config.get("has_scaler") and "scaler_file" in config:
+        scaler_file = config["scaler_file"]
+        if Path(scaler_file).exists():
+            with open(scaler_file, 'rb') as f:
+                scaler = pickle.load(f)
+
+    # Load PCA if available
+    pca = None
+    if config.get("has_pca") and "pca_file" in config:
+        pca_file = config["pca_file"]
+        if Path(pca_file).exists():
+            with open(pca_file, 'rb') as f:
+                pca = pickle.load(f)
+
+    if verbose:
+        print(f"\n{'=' * 70}")
+        print("MODEL LOADED SUCCESSFULLY")
+        print(f"{'=' * 70}")
+        print(f"Model name: {config['model_name']}")
+        print(f"Tag group: {config.get('tag_group', 'N/A')}")
+        print(f"Number of labels: {config.get('n_labels', 'N/A')}")
+        print(f"Saved on: {config.get('datetime', 'N/A')}")
+        print("\nLoaded components:")
+        print("  Model: ✓")
+        print(f"  Thresholds: {'✓' if thresholds is not None else '✗'}")
+        print(f"  Scaler: {'✓' if scaler is not None else '✗'}")
+        print(f"  PCA: {'✓' if pca is not None else '✗'}")
+        if config.get('metrics'):
+            print("\nStored metrics:")
+            for key, value in config['metrics'].items():
+                print(f"  {key}: {value:.4f}" if isinstance(value, (int, float)) else f"  {key}: {value}")
+        print(f"{'=' * 70}\n")
+
+    return {
+        "model": model,
+        "config": config,
+        "thresholds": thresholds,
+        "scaler": scaler,
+        "pca": pca,
+        "tags": config.get("tags"),
+    }
+
+
+def save_model_comparison(
+    models_dict: dict,
+    tags: list[str],
+    save_dir: str = "models",
+    tag_group: str | None = None,
+    **kwargs,
+) -> dict[str, dict]:
+    """Save multiple models for easy comparison.
+
+    Convenience function to save both Random Forest and XGBoost models
+    with all their metadata in one call.
+
+    Parameters
+    ----------
+    models_dict : dict
+        Dictionary mapping model names to model data:
+        {
+            "random_forest": {
+                "model": trained_model,
+                "thresholds": thresholds,
+                "hyperparams": params,
+                "metrics": metrics
+            },
+            "xgboost": {...}
+        }
+    tags : list[str]
+        List of tag names
+    save_dir : str, default="models"
+        Directory to save model files
+    tag_group : str, optional
+        Tag group name (e.g., "Genre")
+    **kwargs
+        Additional arguments passed to save_model (e.g., scaler, pca)
+
+    Returns
+    -------
+    saved_paths : dict[str, dict]
+        Dictionary mapping model names to their saved file paths
+
+    Examples
+    --------
+    >>> # After training and optimizing both models
+    >>> models_to_save = {
+    ...     "random_forest": {
+    ...         "model": rf_results['best_model'],
+    ...         "thresholds": rf_threshold_results['thresholds'],
+    ...         "hyperparams": rf_results['best_params'],
+    ...         "metrics": {'macro_f1': 0.40}
+    ...     },
+    ...     "xgboost": {
+    ...         "model": xgb_results['best_model'],
+    ...         "thresholds": xgb_threshold_results['thresholds'],
+    ...         "hyperparams": xgb_results['best_params'],
+    ...         "metrics": {'macro_f1': 0.45}
+    ...     }
+    ... }
+    >>>
+    >>> paths = save_model_comparison(
+    ...     models_dict=models_to_save,
+    ...     tags=result.tags,
+    ...     tag_group="Genre",
+    ...     scaler=result.scaler,
+    ...     pca=result.pca
+    ... )
+    """
+    saved_paths = {}
+
+    for model_name, model_data in models_dict.items():
+        paths = save_model(
+            model=model_data["model"],
+            model_name=f"{model_name}_{tag_group}" if tag_group else model_name,
+            save_dir=save_dir,
+            tags=tags,
+            thresholds=model_data.get("thresholds"),
+            hyperparams=model_data.get("hyperparams"),
+            metrics=model_data.get("metrics"),
+            tag_group=tag_group,
+            **kwargs,
+        )
+        saved_paths[model_name] = paths
+
+    print(f"\n{'=' * 70}")
+    print(f"SAVED {len(models_dict)} MODELS")
+    print(f"{'=' * 70}\n")
+
+    return saved_paths

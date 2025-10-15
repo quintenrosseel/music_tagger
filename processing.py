@@ -119,6 +119,7 @@ from sklearn.decomposition import PCA
 from sklearn.model_selection import train_test_split
 from sklearn.multioutput import MultiOutputClassifier
 from sklearn.preprocessing import StandardScaler
+from typing import Union, Any
 
 
 class PolarsStandardScaler(BaseEstimator, TransformerMixin):
@@ -756,16 +757,22 @@ class ProcessingResult:
     ----------
     X_train : pl.DataFrame
         Preprocessed training features
+    X_val : pl.DataFrame | None
+        Preprocessed validation features (None if val_size=0)
     X_test : pl.DataFrame
         Preprocessed test features
     y_train : pl.DataFrame
         Training labels (binary matrix)
+    y_val : pl.DataFrame | None
+        Validation labels (binary matrix, None if val_size=0)
     y_test : pl.DataFrame
         Test labels (binary matrix)
     tags : list[str]
         List of tag names after filtering
     song_ids_train : pl.DataFrame
         Song IDs for training set
+    song_ids_val : pl.DataFrame | None
+        Song IDs for validation set (None if val_size=0)
     song_ids_test : pl.DataFrame
         Song IDs for test set
     scaler : PolarsStandardScaler | None
@@ -777,15 +784,17 @@ class ProcessingResult:
     --------
     >>> from processing import preprocess_tag_group
     >>>
-    >>> # Clean usage with dataclass
+    >>> # With validation set
     >>> result = preprocess_tag_group(
     ...     base_df, features_df, "Genre",
+    ...     test_size=0.2, val_size=0.2,
     ...     apply_scaling=True,
     ...     apply_pca=True
     ... )
     >>>
     >>> # Access attributes by name (much cleaner!)
     >>> print(result.X_train.shape)
+    >>> print(result.X_val.shape)
     >>> print(result.tags)
     >>> model.fit(result.X_train.to_numpy(), result.y_train.to_numpy())
     >>>
@@ -794,15 +803,18 @@ class ProcessingResult:
     ...     new_features_scaled = result.scaler.transform(new_features)
     >>>
     >>> # Still supports tuple unpacking if needed (backward compatibility)
-    >>> X_train, X_test, y_train, y_test, tags, *_ = result
+    >>> X_train, X_val, X_test, y_train, y_val, y_test, tags, *_ = result
     """
 
     X_train: "pl.DataFrame"
+    X_val: "pl.DataFrame | None"
     X_test: "pl.DataFrame"
     y_train: "pl.DataFrame"
+    y_val: "pl.DataFrame | None"
     y_test: "pl.DataFrame"
     tags: list[str]
     song_ids_train: "pl.DataFrame"
+    song_ids_val: "pl.DataFrame | None"
     song_ids_test: "pl.DataFrame"
     scaler: "PolarsStandardScaler | None"
     pca: "PolarsPCA | None"
@@ -812,11 +824,14 @@ class ProcessingResult:
         return iter(
             (
                 self.X_train,
+                self.X_val,
                 self.X_test,
                 self.y_train,
+                self.y_val,
                 self.y_test,
                 self.tags,
                 self.song_ids_train,
+                self.song_ids_val,
                 self.song_ids_test,
                 self.scaler,
                 self.pca,
@@ -830,6 +845,7 @@ def preprocess_tag_group(
     tag_group,
     feature_cols=None,
     test_size=0.2,
+    val_size=0.0,
     random_state=42,
     min_train_count=None,
     apply_scaling=True,
@@ -855,6 +871,10 @@ def preprocess_tag_group(
         Feature columns to use. If None, uses all except song_id/song_path
     test_size : float, default=0.2
         Fraction of data to use for test set
+    val_size : float, default=0.0
+        Fraction of TRAINING data to use for validation set.
+        If 0, no validation set is created.
+        Example: test_size=0.2, val_size=0.2 means 60% train, 20% val, 20% test
     random_state : int, default=42
         Random seed for reproducible splits
     min_train_count : int | None, default=None
@@ -875,43 +895,41 @@ def preprocess_tag_group(
     ProcessingResult
         A dataclass containing all preprocessing results with the following attributes:
         - X_train: Preprocessed training features
+        - X_val: Preprocessed validation features (None if val_size=0)
         - X_test: Preprocessed test features
         - y_train: Training labels (binary matrix)
+        - y_val: Validation labels (binary matrix, None if val_size=0)
         - y_test: Test labels (binary matrix)
         - tags: List of tag names after filtering
         - song_ids_train: Song IDs for train set
+        - song_ids_val: Song IDs for validation set (None if val_size=0)
         - song_ids_test: Song IDs for test set
         - scaler: Fitted scaler if apply_scaling=True, else None
         - pca: Fitted PCA if apply_pca=True, else None
 
     Examples
     --------
-    >>> # Clean usage with dataclass (recommended)
+    >>> # With validation set for hyperparameter tuning
     >>> result = preprocess_tag_group(
     ...     base_df, features_df, "Genre",
+    ...     test_size=0.2, val_size=0.2,
     ...     apply_scaling=True,
     ...     apply_pca=True
     ... )
-    >>> print(result.X_train.shape)
-    >>> print(result.tags)
+    >>> print(result.X_train.shape)  # 60% of data
+    >>> print(result.X_val.shape)    # 20% of data
+    >>> print(result.X_test.shape)   # 20% of data
     >>> model.fit(result.X_train.to_numpy(), result.y_train.to_numpy())
     >>>
-    >>> # Full preprocessing with PCA
+    >>> # Without validation set (standard train/test split)
     >>> mood_result = preprocess_tag_group(
     ...     base_df, features_df, "Mood",
     ...     test_size=0.25,
+    ...     val_size=0.0,
     ...     min_train_count=10,
     ...     apply_scaling=True,
     ...     apply_pca=True,
     ...     pca_variance=0.95
-    ... )
-    >>>
-    >>> # Still supports tuple unpacking (backward compatibility)
-    >>> X_train, X_test, y_train, y_test, tags, *_ = preprocess_tag_group(
-    ...     base_df, features_df, "Situation",
-    ...     min_train_count=5,
-    ...     apply_scaling=True,
-    ...     apply_pca=False
     ... )
     """
     if verbose:
@@ -937,21 +955,39 @@ def preprocess_tag_group(
     X_features = X.drop("song_id")
 
     # 2. Split train/test at SONG level
-    # Split features, labels, AND song IDs with the same random state
+    # First split: separate test set
     X_train, X_test, y_train, y_test, song_ids_train, song_ids_test = train_test_split(
         X_features, y, song_ids, test_size=test_size, random_state=random_state
     )
+
+    # Second split: create validation set from training data (if requested)
+    X_val = None
+    y_val = None
+    song_ids_val = None
+
+    if val_size > 0:
+        # Calculate validation size relative to the remaining training data
+        val_size_adjusted = val_size / (1 - test_size)
+        X_train, X_val, y_train, y_val, song_ids_train, song_ids_val = train_test_split(
+            X_train, y_train, song_ids_train,
+            test_size=val_size_adjusted,
+            random_state=random_state
+        )
 
     # 3. Filter rare labels based on training set (optional)
     if min_train_count is not None:
         X_train, y_train, X_test, y_test, tags = filter_rare_labels(
             X_train, y_train, X_test, y_test, tags, min_count=min_train_count
         )
+        # Also filter validation set if it exists
+        if X_val is not None and y_val is not None:
+            y_val = y_val.select(tags)
     elif verbose:
         print("Skipping rare label filtering (min_train_count=None)\n")
 
     # Track the final feature matrices
     X_train_final: pl.DataFrame = X_train
+    X_val_final: pl.DataFrame | None = X_val
     X_test_final: pl.DataFrame = X_test
     scaler: PolarsStandardScaler | None = None
     pca: PolarsPCA | None = None
@@ -963,6 +999,8 @@ def preprocess_tag_group(
         scaler = PolarsStandardScaler()
         X_train_final = scaler.fit_transform(X_train_final)
         X_test_final = scaler.transform(X_test_final)
+        if X_val_final is not None:
+            X_val_final = scaler.transform(X_val_final)
     elif verbose:
         print("Skipping feature normalization (apply_scaling=False)\n")
 
@@ -973,6 +1011,8 @@ def preprocess_tag_group(
         pca = PolarsPCA(n_components=pca_variance)
         X_train_final = pca.fit_transform(X_train_final)
         X_test_final = pca.transform(X_test_final)
+        if X_val_final is not None:
+            X_val_final = pca.transform(X_val_final)
     elif verbose:
         print("Skipping PCA (apply_pca=False)\n")
 
@@ -986,6 +1026,8 @@ def preprocess_tag_group(
         else:
             print(f"  Final features: {X_train_final.shape[1]}")
         print(f"  Train samples: {X_train_final.shape[0]}")
+        if X_val_final is not None:
+            print(f"  Validation samples: {X_val_final.shape[0]}")
         print(f"  Test samples: {X_test_final.shape[0]}")
         print(f"  Active labels: {len(tags)}")
         print(
@@ -994,16 +1036,20 @@ def preprocess_tag_group(
         print("  Preprocessing applied:")
         print(f"    - Scaling: {apply_scaling}")
         print(f"    - PCA: {apply_pca}")
+        print(f"    - Validation split: {val_size > 0}")
         print(f"    - Rare label filtering: {min_train_count is not None}")
         print(f"{'=' * 70}\n")
 
     return ProcessingResult(
         X_train=X_train_final,
+        X_val=X_val_final,
         X_test=X_test_final,
         y_train=y_train,
+        y_val=y_val,
         y_test=y_test,
         tags=tags,
         song_ids_train=song_ids_train,
+        song_ids_val=song_ids_val,
         song_ids_test=song_ids_test,
         scaler=scaler,
         pca=pca,
@@ -1161,3 +1207,126 @@ def predict_with_metadata(
         )
 
     return predictions_with_metadata
+
+
+def predict_with_optimized_thresholds(
+    models: Union[dict[str, Any], Any],
+    X_test: pl.DataFrame,
+    tags: list[str],
+    thresholds: Union[dict[str, "np.ndarray"], "np.ndarray"],
+    songs_df: pl.DataFrame,
+    song_id_col: str = "song_id",
+) -> pl.DataFrame:
+    """Make predictions using optimized thresholds and join with song metadata.
+
+    Convenience function for inference that:
+    1. Gets probability predictions from model(s)
+    2. Applies optimized thresholds (not 0.5!)
+    3. Converts to tag lists
+    4. Joins with song metadata
+
+    Parameters
+    ----------
+    models : dict[str, MultiOutputClassifier] or MultiOutputClassifier
+        Either:
+        - Single model
+        - Dictionary of models (e.g., {"Random Forest": model1, "XGBoost": model2})
+    X_test : pl.DataFrame
+        Test features (must include song_id column)
+    tags : list[str]
+        List of tag names
+    thresholds : dict[str, np.ndarray] or np.ndarray
+        Either:
+        - Single array of thresholds (if single model)
+        - Dictionary of thresholds matching model keys (if multiple models)
+    songs_df : pl.DataFrame
+        Song metadata DataFrame
+    song_id_col : str, default="song_id"
+        Name of the song ID column
+
+    Returns
+    -------
+    pl.DataFrame
+        Predictions with song metadata
+        If single model: columns include "predicted_tags"
+        If multiple models: columns include "{model_name}_predicted_tags" for each model
+
+    Examples
+    --------
+    >>> from models import load_model
+    >>> from processing import predict_with_optimized_thresholds
+    >>>
+    >>> # Single model
+    >>> model_data = load_model("models/xgboost_Genre_model.pkl")
+    >>> predictions = predict_with_optimized_thresholds(
+    ...     models=model_data['model'],
+    ...     X_test=X_test_scaled,
+    ...     tags=model_data['tags'],
+    ...     thresholds=model_data['thresholds'],
+    ...     songs_df=songs_df
+    ... )
+    >>>
+    >>> # Multiple models at once
+    >>> rf_data = load_model("models/rf_model.pkl")
+    >>> xgb_data = load_model("models/xgb_model.pkl")
+    >>> predictions = predict_with_optimized_thresholds(
+    ...     models={"Random Forest": rf_data['model'], "XGBoost": xgb_data['model']},
+    ...     X_test=X_test_scaled,
+    ...     tags=rf_data['tags'],
+    ...     thresholds={"Random Forest": rf_data['thresholds'], "XGBoost": xgb_data['thresholds']},
+    ...     songs_df=songs_df
+    ... )
+    """
+    from models import predict_with_threshold
+    import numpy as np
+
+    # Get song IDs before dropping
+    song_ids = X_test.select(song_id_col)
+    X_features = X_test.drop(song_id_col)
+
+    # Check if multiple models or single model
+    is_multi_model = isinstance(models, dict)
+
+    if is_multi_model:
+        # Multiple models
+        all_predictions = {}
+
+        for model_name, model in models.items():
+            # Get probabilities and apply thresholds
+            _, probs = predict_with_threshold(model, X_features, threshold=0.5)
+            pred_binary = (probs >= thresholds[model_name]).astype(int)
+
+            # Convert to tag lists
+            predicted_tags = []
+            for pred_vector in pred_binary:
+                tag_list = [tags[i] for i in range(len(tags)) if pred_vector[i] == 1]
+                predicted_tags.append(tag_list if tag_list else None)
+
+            all_predictions[f"{model_name}_predicted_tags"] = predicted_tags
+
+        # Create predictions dataframe
+        pred_df = pl.DataFrame({
+            song_id_col: song_ids[song_id_col],
+            **all_predictions
+        })
+
+    else:
+        # Single model
+        _, probs = predict_with_threshold(models, X_features, threshold=0.5)
+        pred_binary = (probs >= thresholds).astype(int)
+
+        # Convert to tag lists
+        predicted_tags = []
+        for pred_vector in pred_binary:
+            tag_list = [tags[i] for i in range(len(tags)) if pred_vector[i] == 1]
+            predicted_tags.append(tag_list if tag_list else None)
+
+        pred_df = pl.DataFrame({
+            song_id_col: song_ids[song_id_col],
+            "predicted_tags": predicted_tags
+        })
+
+    # Join with metadata
+    predictions = songs_df.join(pred_df, on=song_id_col, how="inner")
+
+    return predictions
