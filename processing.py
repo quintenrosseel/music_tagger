@@ -110,9 +110,14 @@ y_pred = clf.predict(X_test_pca.to_numpy())
 ```
 """
 
+from dataclasses import dataclass
+
 import polars as pl
+import pyrekordbox
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.decomposition import PCA
+from sklearn.model_selection import train_test_split
+from sklearn.multioutput import MultiOutputClassifier
 from sklearn.preprocessing import StandardScaler
 
 
@@ -178,7 +183,7 @@ class PolarsStandardScaler(BaseEstimator, TransformerMixin):
         self.with_mean = with_mean
         self.with_std = with_std
 
-    def fit(self, X: pl.DataFrame, y=None):
+    def fit(self, X: pl.DataFrame, y=None) -> "PolarsStandardScaler":
         """Compute the mean and std to be used for later scaling.
 
         Parameters
@@ -333,7 +338,7 @@ class PolarsPCA(BaseEstimator, TransformerMixin):
         self.whiten = whiten
         self.random_state = random_state
 
-    def fit(self, X: pl.DataFrame, y=None):
+    def fit(self, X: pl.DataFrame, y=None) -> "PolarsPCA":
         """Fit the PCA model with X.
 
         Parameters
@@ -578,11 +583,11 @@ def prepare_multilabel_data(
     tags = sorted(group_df["tag_name"].unique().to_list())
 
     print(f"\nPreparing multi-label data for '{tag_group}':")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f"Unique songs: {len(song_tags)}")
     print(f"Unique tags: {len(tags)}")
     print(f"Tags: {', '.join(tags)}")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
     # Create binary label matrix
     # For each song, create a row with 1 if tag is present, 0 otherwise
@@ -722,11 +727,13 @@ def filter_rare_labels(
     valid_tags = counts_df.filter(pl.col("count") >= min_count)["tag"].to_list()
 
     if len(rare_tags) > 0:
-        print(f"\nFiltering rare labels with < {min_count} occurrences in training set:")
-        print(f"{'='*60}")
+        print(
+            f"\nFiltering rare labels with < {min_count} occurrences in training set:"
+        )
+        print(f"{'=' * 60}")
         for row in rare_tags.iter_rows(named=True):
             print(f"  - {row['tag']}: {row['count']} occurrence(s)")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         print(f"Removed {len(rare_tags)} tags, kept {len(valid_tags)} tags\n")
 
         # Filter both train and test to keep only valid tags
@@ -736,3 +743,421 @@ def filter_rare_labels(
         print(f"All {len(tags)} tags meet the minimum count threshold ({min_count})\n")
 
     return X_train, y_train, X_test, y_test, valid_tags
+
+
+@dataclass
+class ProcessingResult:
+    """Result container for preprocess_tag_group function.
+
+    This dataclass provides a clean, typed interface for accessing
+    preprocessing results with named attributes instead of messy tuple unpacking.
+
+    Attributes
+    ----------
+    X_train : pl.DataFrame
+        Preprocessed training features
+    X_test : pl.DataFrame
+        Preprocessed test features
+    y_train : pl.DataFrame
+        Training labels (binary matrix)
+    y_test : pl.DataFrame
+        Test labels (binary matrix)
+    tags : list[str]
+        List of tag names after filtering
+    song_ids_train : pl.DataFrame
+        Song IDs for training set
+    song_ids_test : pl.DataFrame
+        Song IDs for test set
+    scaler : PolarsStandardScaler | None
+        Fitted scaler if apply_scaling=True, else None
+    pca : PolarsPCA | None
+        Fitted PCA if apply_pca=True, else None
+
+    Examples
+    --------
+    >>> from processing import preprocess_tag_group
+    >>>
+    >>> # Clean usage with dataclass
+    >>> result = preprocess_tag_group(
+    ...     base_df, features_df, "Genre",
+    ...     apply_scaling=True,
+    ...     apply_pca=True
+    ... )
+    >>>
+    >>> # Access attributes by name (much cleaner!)
+    >>> print(result.X_train.shape)
+    >>> print(result.tags)
+    >>> model.fit(result.X_train.to_numpy(), result.y_train.to_numpy())
+    >>>
+    >>> # Use the scaler for inference
+    >>> if result.scaler:
+    ...     new_features_scaled = result.scaler.transform(new_features)
+    >>>
+    >>> # Still supports tuple unpacking if needed (backward compatibility)
+    >>> X_train, X_test, y_train, y_test, tags, *_ = result
+    """
+
+    X_train: "pl.DataFrame"
+    X_test: "pl.DataFrame"
+    y_train: "pl.DataFrame"
+    y_test: "pl.DataFrame"
+    tags: list[str]
+    song_ids_train: "pl.DataFrame"
+    song_ids_test: "pl.DataFrame"
+    scaler: "PolarsStandardScaler | None"
+    pca: "PolarsPCA | None"
+
+    def __iter__(self):
+        """Allow tuple unpacking for backward compatibility."""
+        return iter(
+            (
+                self.X_train,
+                self.X_test,
+                self.y_train,
+                self.y_test,
+                self.tags,
+                self.song_ids_train,
+                self.song_ids_test,
+                self.scaler,
+                self.pca,
+            )
+        )
+
+
+def preprocess_tag_group(
+    base_df,
+    features_df,
+    tag_group,
+    feature_cols=None,
+    test_size=0.2,
+    random_state=42,
+    min_train_count=None,
+    apply_scaling=True,
+    apply_pca=False,
+    pca_variance=0.95,
+    verbose=True,
+) -> ProcessingResult:
+    """
+    Flexible preprocessing pipeline for one tag group.
+
+    This function allows you to configure which preprocessing steps to apply,
+    making it easy to experiment with different configurations.
+
+    Parameters
+    ----------
+    base_df : pl.DataFrame
+        Base dataset with song-tag pairs from get_base_dataset()
+    features_df : pl.DataFrame
+        Audio features dataframe with song_id and feature columns
+    tag_group : str
+        Tag group to preprocess (e.g., "Genre", "Mood", "Situation")
+    feature_cols : list[str] | None, default=None
+        Feature columns to use. If None, uses all except song_id/song_path
+    test_size : float, default=0.2
+        Fraction of data to use for test set
+    random_state : int, default=42
+        Random seed for reproducible splits
+    min_train_count : int | None, default=None
+        Minimum occurrences in training set to keep a label.
+        If None, no filtering is applied.
+    apply_scaling : bool, default=True
+        Whether to apply StandardScaler normalization
+    apply_pca : bool, default=False
+        Whether to apply PCA dimensionality reduction
+    pca_variance : float | int, default=0.95
+        PCA components: float for variance ratio (e.g., 0.95),
+        int for fixed number of components. Only used if apply_pca=True.
+    verbose : bool, default=True
+        Whether to print progress and statistics
+
+    Returns
+    -------
+    ProcessingResult
+        A dataclass containing all preprocessing results with the following attributes:
+        - X_train: Preprocessed training features
+        - X_test: Preprocessed test features
+        - y_train: Training labels (binary matrix)
+        - y_test: Test labels (binary matrix)
+        - tags: List of tag names after filtering
+        - song_ids_train: Song IDs for train set
+        - song_ids_test: Song IDs for test set
+        - scaler: Fitted scaler if apply_scaling=True, else None
+        - pca: Fitted PCA if apply_pca=True, else None
+
+    Examples
+    --------
+    >>> # Clean usage with dataclass (recommended)
+    >>> result = preprocess_tag_group(
+    ...     base_df, features_df, "Genre",
+    ...     apply_scaling=True,
+    ...     apply_pca=True
+    ... )
+    >>> print(result.X_train.shape)
+    >>> print(result.tags)
+    >>> model.fit(result.X_train.to_numpy(), result.y_train.to_numpy())
+    >>>
+    >>> # Full preprocessing with PCA
+    >>> mood_result = preprocess_tag_group(
+    ...     base_df, features_df, "Mood",
+    ...     test_size=0.25,
+    ...     min_train_count=10,
+    ...     apply_scaling=True,
+    ...     apply_pca=True,
+    ...     pca_variance=0.95
+    ... )
+    >>>
+    >>> # Still supports tuple unpacking (backward compatibility)
+    >>> X_train, X_test, y_train, y_test, tags, *_ = preprocess_tag_group(
+    ...     base_df, features_df, "Situation",
+    ...     min_train_count=5,
+    ...     apply_scaling=True,
+    ...     apply_pca=False
+    ... )
+    """
+    if verbose:
+        print(f"\n{'=' * 70}")
+        print(f"PREPROCESSING: {tag_group.upper()}")
+        print(f"{'=' * 70}")
+
+    # 1. Prepare multi-label data
+    X, y, tags = prepare_multilabel_data(
+        base_df=base_df,
+        features_df=features_df,
+        tag_group=tag_group,
+        feature_columns=feature_cols,
+    )
+
+    # Show initial label distribution
+    if verbose:
+        print(f"\n{tag_group} - Initial label statistics:")
+        print(get_multilabel_stats(y, tags))
+
+    # IMPORTANT: Save song IDs before dropping them
+    song_ids = X.select("song_id")
+    X_features = X.drop("song_id")
+
+    # 2. Split train/test at SONG level
+    # Split features, labels, AND song IDs with the same random state
+    X_train, X_test, y_train, y_test, song_ids_train, song_ids_test = train_test_split(
+        X_features, y, song_ids, test_size=test_size, random_state=random_state
+    )
+
+    # 3. Filter rare labels based on training set (optional)
+    if min_train_count is not None:
+        X_train, y_train, X_test, y_test, tags = filter_rare_labels(
+            X_train, y_train, X_test, y_test, tags, min_count=min_train_count
+        )
+    elif verbose:
+        print("Skipping rare label filtering (min_train_count=None)\n")
+
+    # Track the final feature matrices
+    X_train_final: pl.DataFrame = X_train
+    X_test_final: pl.DataFrame = X_test
+    scaler: PolarsStandardScaler | None = None
+    pca: PolarsPCA | None = None
+
+    # 4. Normalize features (optional)
+    if apply_scaling:
+        if verbose:
+            print("Normalizing features...")
+        scaler = PolarsStandardScaler()
+        X_train_final = scaler.fit_transform(X_train_final)
+        X_test_final = scaler.transform(X_test_final)
+    elif verbose:
+        print("Skipping feature normalization (apply_scaling=False)\n")
+
+    # 5. Apply PCA (optional)
+    if apply_pca:
+        if verbose:
+            print(f"Applying PCA with n_components={pca_variance}...")
+        pca = PolarsPCA(n_components=pca_variance)
+        X_train_final = pca.fit_transform(X_train_final)
+        X_test_final = pca.transform(X_test_final)
+    elif verbose:
+        print("Skipping PCA (apply_pca=False)\n")
+
+    # Summary
+    if verbose:
+        print(f"\n{tag_group} - Final dataset summary:")
+        print(f"  Original features: {X_train.shape[1]}")
+        if apply_pca:
+            print(f"  PCA components: {X_train_final.shape[1]}")
+            print(f"  Variance preserved: {pca.explained_variance_ratio_.sum():.2%}")
+        else:
+            print(f"  Final features: {X_train_final.shape[1]}")
+        print(f"  Train samples: {X_train_final.shape[0]}")
+        print(f"  Test samples: {X_test_final.shape[0]}")
+        print(f"  Active labels: {len(tags)}")
+        print(
+            f"  Avg tags/song (train): {y_train.select(pl.sum_horizontal(pl.all()).mean()).item():.2f}"
+        )
+        print("  Preprocessing applied:")
+        print(f"    - Scaling: {apply_scaling}")
+        print(f"    - PCA: {apply_pca}")
+        print(f"    - Rare label filtering: {min_train_count is not None}")
+        print(f"{'=' * 70}\n")
+
+    return ProcessingResult(
+        X_train=X_train_final,
+        X_test=X_test_final,
+        y_train=y_train,
+        y_test=y_test,
+        tags=tags,
+        song_ids_train=song_ids_train,
+        song_ids_test=song_ids_test,
+        scaler=scaler,
+        pca=pca,
+    )
+
+
+def predict_with_metadata(
+    processing_result: ProcessingResult,
+    model: MultiOutputClassifier | dict[str, MultiOutputClassifier],
+    db: pyrekordbox.Rekordbox6Database = None,
+    songs_df: pl.DataFrame | None = None,
+) -> pl.DataFrame:
+    """Generate predictions with song metadata from a ProcessingResult.
+
+    This is a convenience function that automates the common workflow of:
+    1. Making predictions on test data
+    2. Converting predictions to labels
+    3. Joining with song metadata (artist, title)
+
+    Parameters
+    ----------
+    processing_result : ProcessingResult
+        The result from preprocess_tag_group()
+    model : MultiOutputClassifier or dict[str, MultiOutputClassifier]
+        Either:
+        - A single fitted sklearn multi-label classifier
+        - A dictionary mapping model names to fitted classifiers
+          (e.g., {"Linear": model1, "Random Forest": model2})
+    db : Rekordbox6Database, optional
+        Database instance to fetch song metadata. Either db or songs_df must be provided.
+    songs_df : pl.DataFrame, optional
+        Pre-fetched songs dataframe with metadata. Either db or songs_df must be provided.
+        Must contain columns: song_id, artist_name, song_title
+
+    Returns
+    -------
+    pl.DataFrame
+        If single model:
+            DataFrame with columns: song_id, artist_name, song_title, predicted_tags
+        If multiple models (dict):
+            DataFrame with columns: song_id, artist_name, song_title,
+            model1_predicted_tags, model2_predicted_tags, ...
+            (one column per model with format: {model_name}_predicted_tags)
+
+    Examples
+    --------
+    >>> from processing import preprocess_tag_group, predict_with_metadata
+    >>> from models import get_random_forest_model, get_linear_model
+    >>>
+    >>> # Preprocess data
+    >>> result = preprocess_tag_group(
+    ...     base_df, features_df, "Genre",
+    ...     apply_scaling=True,
+    ...     apply_pca=True
+    ... )
+    >>>
+    >>> # Single model
+    >>> model = get_random_forest_model(n_estimators=200, max_depth=20)
+    >>> model.fit(result.X_train.to_numpy(), result.y_train.to_numpy())
+    >>> predictions = predict_with_metadata(result, model, db)
+    >>> print(predictions)
+    >>>
+    >>> # Multiple models for comparison
+    >>> models = {
+    ...     "Linear": get_linear_model(),
+    ...     "Random Forest": get_random_forest_model()
+    ... }
+    >>> for model in models.values():
+    ...     model.fit(result.X_train.to_numpy(), result.y_train.to_numpy())
+    >>> predictions = predict_with_metadata(result, models, db)
+    >>> print(predictions)  # Shows predictions from both models side-by-side
+    """
+    # Validate inputs
+    if db is None and songs_df is None:
+        raise ValueError("Either db or songs_df must be provided")
+
+    # Get test song IDs
+    test_song_ids = processing_result.song_ids_test["song_id"].to_list()
+    X_test_np = processing_result.X_test.to_numpy()
+
+    # Check if model is a dictionary (multiple models) or single model
+    is_multi_model = isinstance(model, dict)
+
+    if is_multi_model:
+        # Multiple models: create predictions for each model
+        all_predictions = {}
+
+        for model_name, single_model in model.items():
+            # Get predictions for this model
+            y_pred = single_model.predict(X_test_np)  # type: ignore
+
+            # Convert predictions to labels
+            model_predictions = []
+            for i in range(len(y_pred)):  # type: ignore
+                pred_vector = y_pred[i]  # type: ignore
+                predicted_tags = [
+                    tag for tag, pred in zip(processing_result.tags, pred_vector) if pred == 1
+                ]
+                model_predictions.append(predicted_tags)
+
+            # Store with model name
+            all_predictions[model_name] = model_predictions
+
+        # Create DataFrame with all models' predictions
+        predictions_data = []
+        for i, song_id in enumerate(test_song_ids):
+            row = {"song_id": song_id}
+            for model_name, predictions in all_predictions.items():
+                # Use snake_case for column names
+                col_name = f"{model_name.lower().replace(' ', '_')}_predicted_tags"
+                row[col_name] = predictions[i]
+            predictions_data.append(row)
+
+        predictions_df = pl.DataFrame(predictions_data)
+    else:
+        # Single model: original behavior
+        y_pred = model.predict(X_test_np)  # type: ignore
+
+        # Convert predictions to labels
+        predictions_data = []
+        for i, song_id in enumerate(test_song_ids):
+            pred_vector = y_pred[i]  # type: ignore
+            predicted_tags = [
+                tag for tag, pred in zip(processing_result.tags, pred_vector) if pred == 1
+            ]
+            predictions_data.append({"song_id": song_id, "predicted_tags": predicted_tags})
+
+        predictions_df = pl.DataFrame(predictions_data)
+
+    # Fetch song metadata if needed
+    if songs_df is None:
+        if db is None:
+            raise ValueError("Either db or songs_df must be provided")
+        from utils import get_clean_songs
+
+        songs_df = get_clean_songs(db, rename=True)
+
+    # Join with metadata
+    predictions_with_metadata = predictions_df.join(
+        songs_df.select(["song_id", "artist_name", "song_title"]),
+        on="song_id",
+        how="left",
+    )
+
+    # Reorder columns: song_id, artist_name, song_title, then prediction columns
+    if is_multi_model:
+        prediction_cols = [col for col in predictions_with_metadata.columns
+                          if col.endswith("_predicted_tags")]
+        predictions_with_metadata = predictions_with_metadata.select(
+            ["song_id", "artist_name", "song_title"] + prediction_cols
+        )
+    else:
+        predictions_with_metadata = predictions_with_metadata.select(
+            ["song_id", "artist_name", "song_title", "predicted_tags"]
+        )
+
+    return predictions_with_metadata
