@@ -898,6 +898,7 @@ def tune_random_forest_hyperparams(
     tags: list[str],
     search_type: str = "grid",
     n_iter: int = 20,
+    metric: str = "f1",
     verbose: bool = True,
 ) -> dict:
     """Tune Random Forest hyperparameters using grid or random search.
@@ -923,6 +924,11 @@ def tune_random_forest_hyperparams(
         - 'random': Random sampling of parameter combinations (faster, good for initial exploration)
     n_iter : int, default=20
         Number of iterations for random search (ignored for grid search)
+    metric : {'f1', 'precision', 'recall'}, default='f1'
+        Metric to optimize during hyperparameter search:
+        - 'f1': Optimize macro F1 score (balanced precision/recall)
+        - 'precision': Optimize macro precision (minimize false positives)
+        - 'recall': Optimize macro recall (minimize false negatives)
     verbose : bool, default=True
         Whether to print progress
 
@@ -932,22 +938,24 @@ def tune_random_forest_hyperparams(
         Dictionary containing:
         - 'best_params': Best hyperparameters found
         - 'best_model': Trained model with best parameters
-        - 'best_score': Best macro F1 score achieved
+        - 'best_score': Best score for the chosen metric
         - 'all_results': DataFrame with all tested configurations and scores
 
     Examples
     --------
-    >>> # Grid search (thorough but slower)
-    >>> results = tune_random_forest_hyperparams(
-    ...     X_train, y_train, X_val, y_val, tags,
-    ...     search_type='grid'
-    ... )
-    >>>
-    >>> # Random search (faster, good for initial exploration)
+    >>> # Optimize for F1 (default)
     >>> results = tune_random_forest_hyperparams(
     ...     X_train, y_train, X_val, y_val, tags,
     ...     search_type='random',
-    ...     n_iter=30
+    ...     n_iter=100
+    ... )
+    >>>
+    >>> # Optimize for precision
+    >>> results = tune_random_forest_hyperparams(
+    ...     X_train, y_train, X_val, y_val, tags,
+    ...     search_type='random',
+    ...     n_iter=100,
+    ...     metric='precision'
     ... )
     >>>
     >>> print(f"Best parameters: {results['best_params']}")
@@ -957,6 +965,11 @@ def tune_random_forest_hyperparams(
     # Validate that validation sets are provided
     if X_val is None or y_val is None:
         raise ValueError("Validation sets (X_val, y_val) are required for hyperparameter tuning")
+
+    # Validate metric
+    valid_metrics = ["f1", "precision", "recall"]
+    if metric not in valid_metrics:
+        raise ValueError(f"Invalid metric: {metric}. Choose from {valid_metrics}")
 
     # Convert to numpy if needed
     if isinstance(X_train, pl.DataFrame):
@@ -972,6 +985,7 @@ def tune_random_forest_hyperparams(
         print(f"\n{'=' * 70}")
         print("RANDOM FOREST HYPERPARAMETER TUNING")
         print(f"Search type: {search_type}")
+        print(f"Optimization metric: {metric}")
         print(f"{'=' * 70}\n")
 
     # Define parameter grid
@@ -1032,8 +1046,18 @@ def tune_random_forest_hyperparams(
                 model, X_val, y_val, tags, verbose=False
             )
 
-            score = metrics["macro_f1"]
-            all_results.append({**params, "macro_f1": score})
+            # Get score for the chosen metric
+            score = metrics[f"macro_{metric}"]
+            all_results.append({
+                **params,
+                "macro_f1": metrics["macro_f1"],
+                "macro_precision": metrics["macro_precision"],
+                "macro_recall": metrics["macro_recall"],
+                "weighted_f1": metrics["weighted_f1"],
+                "weighted_precision": metrics["weighted_precision"],
+                "weighted_recall": metrics["weighted_recall"],
+                "optimization_score": score,
+            })
 
             if score > best_score:
                 best_score = score
@@ -1074,8 +1098,18 @@ def tune_random_forest_hyperparams(
                 model, X_val, y_val, tags, verbose=False
             )
 
-            score = metrics["macro_f1"]
-            all_results.append({**params, "macro_f1": score})
+            # Get score for the chosen metric
+            score = metrics[f"macro_{metric}"]
+            all_results.append({
+                **params,
+                "macro_f1": metrics["macro_f1"],
+                "macro_precision": metrics["macro_precision"],
+                "macro_recall": metrics["macro_recall"],
+                "weighted_f1": metrics["weighted_f1"],
+                "weighted_precision": metrics["weighted_precision"],
+                "weighted_recall": metrics["weighted_recall"],
+                "optimization_score": score,
+            })
 
             if score > best_score:
                 best_score = score
@@ -1089,18 +1123,19 @@ def tune_random_forest_hyperparams(
         print(f"\n{'=' * 70}")
         print("TUNING RESULTS")
         print(f"{'=' * 70}")
-        print(f"\nBest macro F1 score: {best_score:.4f}")
+        print(f"\nBest {metric} score: {best_score:.4f}")
         print("\nBest parameters:")
         for k, v in best_params.items():
             print(f"  {k}: {v}")
         print(f"\n{'=' * 70}\n")
 
-    results_df = pl.DataFrame(all_results).sort("macro_f1", descending=True)
+    results_df = pl.DataFrame(all_results).sort("optimization_score", descending=True)
 
     return {
         "best_params": best_params,
         "best_model": best_model,
         "best_score": best_score,
+        "optimization_metric": metric,
         "all_results": results_df,
     }
 
@@ -1113,6 +1148,7 @@ def tune_xgboost_hyperparams(
     tags: list[str],
     search_type: str = "grid",
     n_iter: int = 20,
+    metric: str = "f1",
     verbose: bool = True,
 ) -> dict:
     """Tune XGBoost hyperparameters using grid or random search.
@@ -1138,6 +1174,11 @@ def tune_xgboost_hyperparams(
         - 'random': Random sampling of parameter combinations
     n_iter : int, default=20
         Number of iterations for random search (ignored for grid search)
+    metric : {'f1', 'precision', 'recall'}, default='f1'
+        Metric to optimize during hyperparameter search:
+        - 'f1': Optimize macro F1 score (balanced precision/recall)
+        - 'precision': Optimize macro precision (minimize false positives)
+        - 'recall': Optimize macro recall (minimize false negatives)
     verbose : bool, default=True
         Whether to print progress
 
@@ -1147,22 +1188,32 @@ def tune_xgboost_hyperparams(
         Dictionary containing:
         - 'best_params': Best hyperparameters found
         - 'best_model': Trained model with best parameters
-        - 'best_score': Best macro F1 score achieved
+        - 'best_score': Best score for the chosen metric
         - 'all_results': DataFrame with all tested configurations and scores
 
     Examples
     --------
-    >>> # Grid search
-    >>> results = tune_xgboost_hyperparams(
-    ...     X_train, y_train, X_val, y_val, tags,
-    ...     search_type='grid'
-    ... )
-    >>>
-    >>> # Random search
+    >>> # Optimize for F1 (default)
     >>> results = tune_xgboost_hyperparams(
     ...     X_train, y_train, X_val, y_val, tags,
     ...     search_type='random',
-    ...     n_iter=30
+    ...     n_iter=100
+    ... )
+    >>>
+    >>> # Optimize for precision
+    >>> results = tune_xgboost_hyperparams(
+    ...     X_train, y_train, X_val, y_val, tags,
+    ...     search_type='random',
+    ...     n_iter=100,
+    ...     metric='precision'
+    ... )
+    >>>
+    >>> # Optimize for recall
+    >>> results = tune_xgboost_hyperparams(
+    ...     X_train, y_train, X_val, y_val, tags,
+    ...     search_type='random',
+    ...     n_iter=100,
+    ...     metric='recall'
     ... )
     >>>
     >>> print(f"Best parameters: {results['best_params']}")
@@ -1174,6 +1225,11 @@ def tune_xgboost_hyperparams(
     # Validate that validation sets are provided
     if X_val is None or y_val is None:
         raise ValueError("Validation sets (X_val, y_val) are required for hyperparameter tuning")
+
+    # Validate metric
+    valid_metrics = ["f1", "precision", "recall"]
+    if metric not in valid_metrics:
+        raise ValueError(f"Invalid metric: {metric}. Choose from {valid_metrics}")
 
     # Convert to numpy if needed
     if isinstance(X_train, pl.DataFrame):
@@ -1189,6 +1245,7 @@ def tune_xgboost_hyperparams(
         print(f"\n{'=' * 70}")
         print("XGBOOST HYPERPARAMETER TUNING")
         print(f"Search type: {search_type}")
+        print(f"Optimization metric: {metric}")
         print(f"{'=' * 70}\n")
 
     # Define parameter grid
@@ -1250,8 +1307,18 @@ def tune_xgboost_hyperparams(
                 model, X_val, y_val, tags, verbose=False
             )
 
-            score = metrics["macro_f1"]
-            all_results.append({**params, "macro_f1": score})
+            # Get score for the chosen metric
+            score = metrics[f"macro_{metric}"]
+            all_results.append({
+                **params,
+                "macro_f1": metrics["macro_f1"],
+                "macro_precision": metrics["macro_precision"],
+                "macro_recall": metrics["macro_recall"],
+                "weighted_f1": metrics["weighted_f1"],
+                "weighted_precision": metrics["weighted_precision"],
+                "weighted_recall": metrics["weighted_recall"],
+                "optimization_score": score,
+            })
 
             if score > best_score:
                 best_score = score
@@ -1294,8 +1361,18 @@ def tune_xgboost_hyperparams(
                 model, X_val, y_val, tags, verbose=False
             )
 
-            score = metrics["macro_f1"]
-            all_results.append({**params, "macro_f1": score})
+            # Get score for the chosen metric
+            score = metrics[f"macro_{metric}"]
+            all_results.append({
+                **params,
+                "macro_f1": metrics["macro_f1"],
+                "macro_precision": metrics["macro_precision"],
+                "macro_recall": metrics["macro_recall"],
+                "weighted_f1": metrics["weighted_f1"],
+                "weighted_precision": metrics["weighted_precision"],
+                "weighted_recall": metrics["weighted_recall"],
+                "optimization_score": score,
+            })
 
             if score > best_score:
                 best_score = score
@@ -1309,18 +1386,19 @@ def tune_xgboost_hyperparams(
         print(f"\n{'=' * 70}")
         print("TUNING RESULTS")
         print(f"{'=' * 70}")
-        print(f"\nBest macro F1 score: {best_score:.4f}")
+        print(f"\nBest {metric} score: {best_score:.4f}")
         print("\nBest parameters:")
         for k, v in best_params.items():
             print(f"  {k}: {v}")
         print(f"\n{'=' * 70}\n")
 
-    results_df = pl.DataFrame(all_results).sort("macro_f1", descending=True)
+    results_df = pl.DataFrame(all_results).sort("optimization_score", descending=True)
 
     return {
         "best_params": best_params,
         "best_model": best_model,
         "best_score": best_score,
+        "optimization_metric": metric,
         "all_results": results_df,
     }
 
@@ -1421,6 +1499,13 @@ def optimize_prediction_thresholds(
         )
     )
 
+    # Calculate weighted averages
+    opt_weighted_precision, opt_weighted_recall, opt_weighted_f1, _ = (
+        precision_recall_fscore_support(
+            y_val, y_pred_optimized, average="weighted", zero_division=0
+        )
+    )
+
     # Create threshold comparison DataFrame
     threshold_df = pl.DataFrame(
         {
@@ -1450,6 +1535,9 @@ def optimize_prediction_thresholds(
             "macro_precision": opt_macro_precision,
             "macro_recall": opt_macro_recall,
             "macro_f1": opt_macro_f1,
+            "weighted_precision": opt_weighted_precision,
+            "weighted_recall": opt_weighted_recall,
+            "weighted_f1": opt_weighted_f1,
             "per_label_f1": f1,
         },
         "improvement": improvement,
